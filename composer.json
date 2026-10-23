@@ -1,5 +1,5 @@
 {
-    "name": "pusher/pusher-php-server",
+    "name": "shahinmoyshan/pusher-php-server",
     "description": "Pusher Client fine-tuned for tinymvc/spark php framework",
     "license": "MIT",
     "require": {
