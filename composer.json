@@ -1,0 +1,24 @@
+{
+    "name": "pusher/pusher-php-server",
+    "description": "Pusher Client fine-tuned for tinymvc/spark php framework",
+    "license": "MIT",
+    "require": {
+        "php": ">=8.2",
+        "ext-curl": "*",
+        "ext-json": "*",
+        "tinymvc/tinycore": "^4.0 || dev-main || @dev"
+    },
+    "autoload": {
+        "psr-4": {
+            "Pusher\\": "src/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "@php tests/run.php"
+    }
+}
