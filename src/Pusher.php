@@ -10,11 +10,13 @@ use function array_key_exists;
 use function count;
 use function in_array;
 use function is_array;
+use function is_int;
 use function is_null;
 use function is_object;
 use function is_scalar;
 use function is_string;
 use function sprintf;
+use function strlen;
 
 class Pusher implements PusherInterface
 {
@@ -36,6 +38,7 @@ class Pusher implements PusherInterface
         'port' => 80,
         'path' => '',
         'timeout' => 30,
+        'curl_options' => [],
     ];
 
     /**
@@ -80,24 +83,18 @@ class Pusher implements PusherInterface
         if (isset($options['useTLS'])) {
             $useTLS = $options['useTLS'] === true;
         }
-        if (
-            $useTLS &&
-            !isset($options['scheme']) &&
-            !isset($options['port'])
-        ) {
-            $options['scheme'] = 'https';
-            $options['port'] = 443;
-        }
+        $options['scheme'] ??= $useTLS ? 'https' : 'http';
+        $options['port'] ??= $options['scheme'] === 'https' ? 443 : 80;
 
         $this->settings['auth_key'] = $auth_key;
         $this->settings['secret'] = $secret;
         $this->settings['app_id'] = $app_id;
         $this->settings['base_path'] = '/apps/' . $this->settings['app_id'];
 
-        foreach ($options as $key => $value) {
+        foreach (['scheme', 'port', 'path', 'timeout', 'curl_options'] as $key) {
             // only set if valid setting/option
-            if (isset($this->settings[$key])) {
-                $this->settings[$key] = $value;
+            if (array_key_exists($key, $options)) {
+                $this->settings[$key] = $options[$key];
             }
         }
 
@@ -114,6 +111,28 @@ class Pusher implements PusherInterface
 
         // ensure host doesn't have a scheme prefix
         $this->settings['host'] = preg_replace('/^http[s]?\:\/\//', '', $this->settings['host'], 1);
+        if (
+            !in_array($this->settings['scheme'], ['http', 'https'], true)
+            || filter_var($this->settings['port'], FILTER_VALIDATE_INT, ['options' => ['min_range' => 1, 'max_range' => 65535]]) === false
+            || filter_var($this->settings['timeout'], FILTER_VALIDATE_INT, ['options' => ['min_range' => 1]]) === false
+            || !is_array($this->settings['curl_options'])
+        ) {
+            throw new PusherException('Invalid HTTP scheme, port, timeout or curl_options.');
+        }
+        $host = parse_url('http://' . $this->settings['host']);
+        if (
+            !is_array($host) || empty($host['host']) || isset($host['user']) || isset($host['pass'])
+            || isset($host['port']) || isset($host['path']) || isset($host['query']) || isset($host['fragment'])
+        ) {
+            throw new PusherException('Host must contain only a hostname or bracketed IPv6 address.');
+        }
+        if (!is_string($this->settings['path']) || preg_match('/[?#\x00-\x20]/', $this->settings['path'])) {
+            throw new PusherException('Invalid API path prefix.');
+        }
+        $pathPrefix = trim($this->settings['path'], '/');
+        $this->settings['path'] = $pathPrefix === '' ? '' : '/' . $pathPrefix;
+        $this->settings['port'] = (int) $this->settings['port'];
+        $this->settings['timeout'] = (int) $this->settings['timeout'];
 
         if (!array_key_exists('encryption_master_key_base64', $options)) {
             $options['encryption_master_key_base64'] = '';
@@ -251,11 +270,14 @@ class Pusher implements PusherInterface
      */
     private function validate_channels(array $channels): void
     {
-        if (count($channels) > 100) {
-            throw new PusherException('An event can be triggered on a maximum of 100 channels in a single call.');
+        if (count($channels) < 1 || count($channels) > 100) {
+            throw new PusherException('An event requires between 1 and 100 channels.');
         }
 
         foreach ($channels as $channel) {
+            if (!is_string($channel)) {
+                throw new PusherException('Channel names must be strings.');
+            }
             $this->validate_channel($channel);
         }
     }
@@ -269,7 +291,7 @@ class Pusher implements PusherInterface
      */
     private function validate_channel(string $channel): void
     {
-        if (!preg_match('/\A#?[-a-zA-Z0-9_=@,.;]+\z/', $channel)) {
+        if (strlen($channel) > 164 || !preg_match('/\A#?[-a-zA-Z0-9_=@,.;]+\z/', $channel)) {
             throw new PusherException("Invalid channel name $channel");
         }
     }
@@ -317,7 +339,7 @@ class Pusher implements PusherInterface
             $this->settings['auth_key'],
             $this->settings['secret'],
             $request_method,
-            $path,
+            $this->settings['path'] . $path,
             $query_params
         );
     }
@@ -358,9 +380,22 @@ class Pusher implements PusherInterface
         $params['auth_timestamp'] = ($auth_timestamp === null ? time() : $auth_timestamp);
         $params['auth_version'] = $auth_version;
 
-        $params = [...$params, ...$query_params];
+        foreach ($query_params as $key => $value) {
+            $key = strtolower((string) $key);
+            if (
+                !preg_match('/\A[a-z0-9_]+\z/', $key) || str_starts_with($key, 'auth_')
+                || (!is_string($value) && !is_int($value))
+            ) {
+                throw new PusherException('Query parameters must be scalar values with non-reserved names.');
+            }
+            if (array_key_exists($key, $params)) {
+                throw new PusherException('Duplicate query parameter.');
+            }
+            $params[$key] = (string) $value;
+        }
         ksort($params);
 
+        $request_method = strtoupper($request_method);
         $string_to_sign = "$request_method\n$request_path\n" . self::array_implode('=', '&', $params);
 
         $auth_signature = hash_hmac('sha256', $string_to_sign, $auth_secret, false);
@@ -415,6 +450,9 @@ class Pusher implements PusherInterface
      */
     public function createRequest(string $method, string $path, array $params = [], mixed $body = null, array $headers = []): HttpRequestContract
     {
+        if (preg_match('/[?#\x00-\x20]/', $path)) {
+            throw new PusherException('API paths must be URL-encoded paths without a query or fragment.');
+        }
         $prefix = rtrim($this->channels_url_prefix(), '/');
         $fullPath = str_starts_with($path, '/apps/')
             ? $path
@@ -435,23 +473,32 @@ class Pusher implements PusherInterface
             }, null, HttpRequest::class);
             $setKey($request, $key);
         }
+        if ($request->hasAttachments() || $request->isMultipart()) {
+            throw new PusherException('Pusher HTTP templates cannot contain multipart uploads.');
+        }
+        $request->withOptions($this->settings['curl_options']);
 
         $request->setMethod(strtoupper($method))
             ->setUrl($fullUrl)
             ->setParams($params)
             ->setData($body ?? [])
-            ->withHeaders($mergedHeaders);
+            ->withHeaders($mergedHeaders)
+            // Retrying a publish after a lost response can deliver it twice.
+            ->withRetry(0)
+            ->withOption(CURLOPT_FOLLOWLOCATION, false)
+            ->withOption(CURLOPT_POSTFIELDS, null)
+            ->withOption(CURLOPT_POST, strtoupper($method) === 'POST')
+            ->withOption(CURLOPT_HTTPGET, strtoupper($method) === 'GET')
+            ->withOption(CURLOPT_NOBODY, strtoupper($method) === 'HEAD')
+            ->withOption(CURLOPT_CUSTOMREQUEST, strtoupper($method))
+            ->withOption(CURLOPT_URL, $request->getFullUrl());
 
         if (in_array(strtoupper($method), ['POST', 'PUT', 'PATCH'], true) && $body !== null) {
             $request->withPostFields($body, 'application/json');
         }
 
         if ($this->client === null && isset($this->settings['timeout'])) {
-            $request->withTimeout((int) $this->settings['timeout']);
-        }
-
-        if (isset($this->settings['curl_options']) && is_array($this->settings['curl_options'])) {
-            $request->withOptions($this->settings['curl_options']);
+            $request->withTimeout($this->settings['timeout']);
         }
 
         return $request;
@@ -496,7 +543,7 @@ class Pusher implements PusherInterface
     public function trigger($channels, string $event, $data, array $params = [], bool $already_encoded = false): object
     {
         $post_value = $this->make_trigger_body($channels, $event, $data, $params, $already_encoded);
-        $this->log('trigger POST: {post_value}', compact('post_value'));
+        $this->log('Publishing event request.', ['bytes' => strlen($post_value)]);
         return $this->process_trigger_result($this->post('/events', $post_value));
     }
 
@@ -516,7 +563,7 @@ class Pusher implements PusherInterface
     public function triggerAsync($channels, string $event, $data, array $params = [], bool $already_encoded = false): HttpRequestContract
     {
         $post_value = $this->make_trigger_body($channels, $event, $data, $params, $already_encoded);
-        $this->log('trigger POST: {post_value}', compact('post_value'));
+        $this->log('Preparing event request.', ['bytes' => strlen($post_value)]);
         return $this->postAsync('/events', $post_value);
     }
 
@@ -568,7 +615,7 @@ class Pusher implements PusherInterface
     public function triggerBatch(array $batch = [], bool $already_encoded = false): object
     {
         $post_value = $this->make_trigger_batch_body($batch, $already_encoded);
-        $this->log('trigger POST: {post_value}', compact('post_value'));
+        $this->log('Publishing batch request.', ['bytes' => strlen($post_value)]);
         return $this->process_trigger_result($this->post('/batch_events', $post_value));
     }
 
@@ -584,7 +631,7 @@ class Pusher implements PusherInterface
     public function triggerBatchAsync(array $batch = [], bool $already_encoded = false): HttpRequestContract
     {
         $post_value = $this->make_trigger_batch_body($batch, $already_encoded);
-        $this->log('trigger POST: {post_value}', compact('post_value'));
+        $this->log('Preparing batch request.', ['bytes' => strlen($post_value)]);
         return $this->postAsync('/batch_events', $post_value);
     }
 
@@ -601,7 +648,7 @@ class Pusher implements PusherInterface
     public function terminateUserConnections(string $user_id): object
     {
         $this->validate_user_id($user_id);
-        return $this->post("/users/$user_id/terminate_connections", "{}");
+        return $this->post('/users/' . rawurlencode($user_id) . '/terminate_connections', "{}");
     }
 
     /**
@@ -616,7 +663,7 @@ class Pusher implements PusherInterface
     public function terminateUserConnectionsAsync(string $user_id): HttpRequestContract
     {
         $this->validate_user_id($user_id);
-        return $this->postAsync("/users/$user_id/terminate_connections", "{}");
+        return $this->postAsync('/users/' . rawurlencode($user_id) . '/terminate_connections', "{}");
     }
 
     /**
@@ -632,7 +679,7 @@ class Pusher implements PusherInterface
     public function getChannelInfo(string $channel, array $params = []): object
     {
         $this->validate_channel($channel);
-        return $this->get("/channels/$channel", $params);
+        return $this->get('/channels/' . rawurlencode($channel), $params);
     }
 
     /**
@@ -666,7 +713,8 @@ class Pusher implements PusherInterface
      */
     public function getPresenceUsers(string $channel): object
     {
-        return $this->get("/channels/$channel/users");
+        $this->validate_channel($channel);
+        return $this->get('/channels/' . rawurlencode($channel) . '/users');
     }
 
     /**
@@ -693,10 +741,14 @@ class Pusher implements PusherInterface
         }
 
         try {
-            return json_decode($response->body(), $associative, 512, JSON_THROW_ON_ERROR);
+            $decoded = json_decode($response->body(), $associative, 512, JSON_THROW_ON_ERROR);
         } catch (\JsonException $e) {
             throw new PusherException('Data decoding error.', 0, $e);
         }
+        if ($associative ? !is_array($decoded) : !is_object($decoded)) {
+            throw new PusherException('Expected a JSON object response.');
+        }
+        return $decoded;
     }
 
     /**
@@ -742,10 +794,14 @@ class Pusher implements PusherInterface
         }
 
         try {
-            return json_decode($response->body(), false, 512, JSON_THROW_ON_ERROR);
+            $decoded = json_decode($response->body(), false, 512, JSON_THROW_ON_ERROR);
         } catch (\JsonException $e) {
             throw new PusherException('Data decoding error.', 0, $e);
         }
+        if (!is_object($decoded)) {
+            throw new PusherException('Expected a JSON object response.');
+        }
+        return $decoded;
     }
 
     /**
@@ -803,13 +859,27 @@ class Pusher implements PusherInterface
             $req->key = $key;
         }, null, HttpRequest::class);
 
+        $responseKeys = [];
         foreach ($poolRequests as $key => $request) {
+            if (!$request instanceof HttpRequestContract) {
+                throw new PusherException('Pool entries must implement HttpRequestContract.');
+            }
+            $request = clone $request;
             if ($request instanceof HttpRequest) {
                 $setKey($request, $key);
             }
+            if (array_key_exists($request->getKey(), $responseKeys)) {
+                throw new PusherException('Custom pool requests must have unique request keys.');
+            }
+            $responseKeys[$request->getKey()] = $key;
+            $poolRequests[$key] = $request;
         }
 
-        $rawResponses = $pool->execute($poolRequests);
+        try {
+            $rawResponses = $pool->execute($poolRequests);
+        } catch (\Throwable $error) {
+            throw new ApiErrorException($error->getMessage(), 0, $error);
+        }
 
         $results = [];
         foreach ($rawResponses as $key => $response) {
@@ -825,10 +895,11 @@ class Pusher implements PusherInterface
             } catch (\JsonException $e) {
                 throw new PusherException('Data decoding error.', 0, $e);
             }
-            if (is_object($decoded)) {
-                $decoded = $this->process_trigger_result($decoded);
+            if (!is_object($decoded)) {
+                throw new PusherException('Expected a JSON object response.');
             }
-            $results[$key] = $decoded;
+            $decoded = $this->process_trigger_result($decoded);
+            $results[$responseKeys[$key]] = $decoded;
         }
 
         return $results;
@@ -949,8 +1020,20 @@ class Pusher implements PusherInterface
             throw new PusherException('Data encoding error.', 0, $e);
         }
 
+        if (
+            !is_object($decoded_json) || !is_int($decoded_json->time_ms ?? null)
+            || !is_array($decoded_json->events ?? null)
+        ) {
+            throw new PusherException('Invalid webhook payload.');
+        }
         foreach ($decoded_json->events as $event) {
-            if (PusherCrypto::is_encrypted_channel($event->channel)) {
+            if (
+                !is_object($event) || !is_string($event->name ?? null)
+                || (isset($event->channel) && !is_string($event->channel))
+            ) {
+                throw new PusherException('Invalid webhook event.');
+            }
+            if (isset($event->channel) && PusherCrypto::is_encrypted_channel($event->channel)) {
                 if ($this->crypto !== null) {
                     $decryptedEvent = $this->crypto->decrypt_event($event);
 
@@ -979,16 +1062,27 @@ class Pusher implements PusherInterface
      */
     public function verifySignature(array $headers, string $body): void
     {
-        $x_pusher_key = $headers['X-Pusher-Key'] ?? $headers['x-pusher-key'] ?? null;
-        $x_pusher_signature = $headers['X-Pusher-Signature'] ?? $headers['x-pusher-signature'] ?? null;
-        if ($x_pusher_key === $this->settings['auth_key']) {
+        $normalized = [];
+        foreach ($headers as $key => $value) {
+            $key = strtolower($key);
+            if (array_key_exists($key, $normalized)) {
+                throw new PusherException('Ambiguous webhook headers.');
+            }
+            $normalized[$key] = $value;
+        }
+        $x_pusher_key = $normalized['x-pusher-key'] ?? null;
+        $x_pusher_signature = $normalized['x-pusher-signature'] ?? null;
+        if (!is_string($x_pusher_key) || !is_string($x_pusher_signature)) {
+            throw new PusherException('Missing or invalid webhook signature headers.');
+        }
+        if (hash_equals($this->settings['auth_key'], $x_pusher_key)) {
             $expected = hash_hmac('sha256', $body, $this->settings['secret']);
-            if ($expected === $x_pusher_signature) {
+            if (hash_equals($expected, $x_pusher_signature)) {
                 return;
             }
         }
 
-        throw new PusherException(sprintf('Received WebHook with invalid signature: got %s.', (string) $x_pusher_signature));
+        throw new PusherException('Received webhook with invalid signature.');
     }
 
     /**
@@ -1006,6 +1100,21 @@ class Pusher implements PusherInterface
      */
     private function make_event(array $channels, string $event, $data, array $params = [], ?string $info = null, bool $already_encoded = false): array
     {
+        if (
+            $event === '' || strlen($event) > 200 || str_starts_with($event, 'pusher:')
+            || str_starts_with($event, 'pusher_internal:')
+        ) {
+            throw new PusherException('Invalid or reserved event name.');
+        }
+        if ($already_encoded && !is_string($data)) {
+            throw new PusherException('Already encoded event data must be a string.');
+        }
+        foreach (['name', 'data', 'channel', 'channels'] as $field) {
+            if (array_key_exists($field, $params)) {
+                throw new PusherException("Event parameters cannot override {$field}.");
+            }
+        }
+
         $has_encrypted_channel = false;
         foreach ($channels as $chan) {
             if (PusherCrypto::is_encrypted_channel($chan)) {
@@ -1015,17 +1124,19 @@ class Pusher implements PusherInterface
         }
 
         if ($has_encrypted_channel) {
-            if (PusherCrypto::has_mixed_channels($channels)) {
-                throw new PusherException('You cannot trigger to encrypted and non-encrypted channels at the same time');
-            } else {
-                try {
-                    $data_encoded = $this->crypto->encrypt_payload(
-                        $channels[0],
-                        $already_encoded ? $data : json_encode($data, JSON_THROW_ON_ERROR)
-                    );
-                } catch (\JsonException $e) {
-                    throw new PusherException('Data encoding error.');
-                }
+            if ($this->crypto === null) {
+                throw new PusherException('An encryption master key is required for encrypted channels.');
+            }
+            if (count($channels) !== 1) {
+                throw new PusherException('Encrypted events must target a single channel.');
+            }
+            try {
+                $data_encoded = $this->crypto->encrypt_payload(
+                    $channels[0],
+                    $already_encoded ? $data : json_encode($data, JSON_THROW_ON_ERROR)
+                );
+            } catch (\JsonException $e) {
+                throw new PusherException('Data encoding error.', 0, $e);
             }
         } else {
             try {
@@ -1035,11 +1146,8 @@ class Pusher implements PusherInterface
             }
         }
 
-        // json_encode might return false on failure
-        if (!$data_encoded) {
-            $this->log('Failed to perform json_encode on the the provided data: {error}', [
-                'error' => print_r($data, true),
-            ], 'error');
+        if (strlen($data_encoded) > 10240) {
+            throw new PusherException('Event data exceeds the 10240-byte limit.');
         }
 
         $post_params = [];
@@ -1077,6 +1185,7 @@ class Pusher implements PusherInterface
         }
 
         $this->validate_channels($channels);
+        $channels = array_values($channels);
         if (isset($params['socket_id'])) {
             $this->validate_socket_id($params['socket_id']);
         }
@@ -1102,7 +1211,16 @@ class Pusher implements PusherInterface
      */
     private function make_trigger_batch_body(array $batch = [], bool $already_encoded = false): string
     {
+        if (!array_is_list($batch) || count($batch) < 1 || count($batch) > 10) {
+            throw new PusherException('A batch requires a list of 1 to 10 events.');
+        }
         foreach ($batch as $key => $event) {
+            if (
+                !is_array($event) || !is_string($event['channel'] ?? null)
+                || !is_string($event['name'] ?? null) || !array_key_exists('data', $event)
+            ) {
+                throw new PusherException('Each batch event requires channel, name and data.');
+            }
             $this->validate_channel($event['channel']);
             if (isset($event['socket_id'])) {
                 $this->validate_socket_id($event['socket_id']);

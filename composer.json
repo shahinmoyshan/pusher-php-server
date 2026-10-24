@@ -6,7 +6,7 @@
         "php": ">=8.2",
         "ext-curl": "*",
         "ext-json": "*",
-        "tinymvc/tinycore": "^4.0 || dev-main || @dev"
+        "tinymvc/tinycore": "^4.1 || dev-main"
     },
     "autoload": {
         "psr-4": {

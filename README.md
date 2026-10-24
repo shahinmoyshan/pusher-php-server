@@ -4,7 +4,7 @@ A lightweight, modern Pusher HTTP REST API client fine-tuned for the **TinyMVC /
 
 [![PHP Version](https://img.shields.io/badge/php-%3E%3D8.2-blue.svg)](https://php.net)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-59%20passed-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/tests-82%20passed-brightgreen.svg)](tests/)
 
 ---
 
@@ -28,7 +28,7 @@ This package is a modernized, framework-optimized fork derived from the official
 composer require shahinmoyshan/pusher-php-server
 ```
 
-> **Requirements:** PHP 8.2 or higher, `ext-curl`, `ext-json`, and `tinymvc/tinycore` (^4.0).
+> **Requirements:** PHP 8.2 or higher, `ext-curl`, `ext-json`, and `tinymvc/tinycore` (^4.1.18).
 
 ---
 
@@ -153,7 +153,7 @@ echo $pusher->authorizePresenceChannel($channel, $socketId, $userId, $userInfo);
 
 ### 4. Async Requests & Concurrent HTTP Pooling
 
-`shahinmoyshan/pusher-php-server` returns Spark HTTP request instances (`Spark\Http\Client\Contracts\HttpRequestContract`) for all async methods, allowing non-blocking dispatch and concurrent multi-request pooling via `HttpPool`:
+`shahinmoyshan/pusher-php-server` returns Spark HTTP request instances (`Spark\Http\Client\Contracts\HttpRequestContract`) for all async methods, for later execution or concurrent multi-request pooling via `HttpPool`. Preparing a request performs no I/O; `execute()` and `pool()` wait for network completion and must not run inside a ReactPHP server callback:
 
 ```php
 // 1. Prepare async requests
@@ -280,10 +280,10 @@ composer test
 php tests/run.php
 ```
 
-All 59 unit, feature, crypto, and mock HTTP pool tests are fully covered:
+The suite verifies unit behavior, crypto, and native HTTP transport against local fixtures:
 
 ```
-Tests:    59 passed (161 assertions)
+Tests:    82 passed (196 assertions)
 Duration: ~6.0s
 ```
 
@@ -294,3 +294,17 @@ Duration: ~6.0s
 This package is open-sourced software licensed under the [MIT license](LICENSE).
 Credit to the original Pusher team for the initial architecture in [`pusher/pusher-http-php`](https://github.com/pusher/pusher-http-php).
 Optimized and maintained by [Shahin Moyshan](https://github.com/shahinmoyshan) for the TinyMVC / Spark ecosystem.
+
+## Transport and compatibility contracts
+
+All publishing and query requests use `Spark\Http\Client\HttpRequest` and `HttpPool`. There is no Guzzle HTTP transport. TinyCore 4.1 or later is required. Each request clones the configured template, preserves transport settings and custom headers, and replaces the URL, method, query and raw JSON body. Multipart templates are rejected. Signed paths include a configured `path` prefix; channel/user path segments are URL-encoded. Redirects are not followed.
+
+Automatic transport retries are disabled, including on templates: a server can accept an event and then lose its response, so retrying may duplicate delivery. You can explicitly call `withRetry()` on a prepared request if your application tolerates duplicates. Neither `trigger()` nor `pool()` provides durable or exactly-once delivery. Synchronous and pooled transport failures become `ApiErrorException`; API errors preserve the HTTP status. Pools execute concurrently, preserve the caller's result keys and do not mutate caller-owned requests. A pool failure does not roll back requests that already succeeded. Custom `HttpRequestContract` implementations need unique internal keys.
+
+Event data is limited to 10,240 bytes, names to 200 bytes, channels to 164 bytes, fan-out to 1–100 channels, and batches to 1–10 items. Already-encoded data must be a string. Reserved event fields cannot be replaced through the optional parameters. Encrypted publishing requires a key and one channel per event, since ciphertext is derived from the channel. Logging reports request sizes, not payload contents.
+
+The Pusher cloud API supports user authentication, user events, termination and webhooks. Relay currently supports public/private/presence subscriptions and the event, batch, channel and presence-user endpoints; it does not implement cloud user-sign-in/termination or webhooks. Use those SDK methods only with a server that implements them.
+
+Authorization methods create signatures, not application access decisions. Authenticate the current user and enforce channel access before calling them. Verify webhook signatures over the exact raw body before trusting events; header names are case-insensitive, comparisons are timing-safe, and malformed signed payloads raise `PusherException`.
+
+The integration fixtures verify the received method, URL path, HMAC and raw body checksum. Regression tests exercise template reuse, exact percent/plus encoding, duplicate pool references, disabled redirects, a lost response without duplicate publishing, encryption edge cases and webhook validation. Run `php tests/run.php` after `composer install`. Verify Relay interoperability from the Relay checkout with `RELAY_PUSHER_SOURCE=../pusher-php-server npm run test:load`.

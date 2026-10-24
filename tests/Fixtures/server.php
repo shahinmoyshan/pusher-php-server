@@ -12,11 +12,46 @@ if (isset($_SERVER['QUERY_STRING'])) {
 
 $rawInput = file_get_contents('php://input');
 
-// Verify auth query parameters exist on all requests
-if (!isset($query['auth_key']) || !isset($query['auth_signature'])) {
+// Verify the exact method, URL path and raw body received by the native HTTP client.
+$signature = $query['auth_signature'] ?? '';
+unset($query['auth_signature']);
+ksort($query);
+$parts = [];
+foreach ($query as $key => $value) {
+    $parts[] = "$key=$value";
+}
+$expected = hash_hmac('sha256', "$method\n$path\n" . implode('&', $parts), 'test_secret');
+if (
+    ($query['auth_key'] ?? '') !== 'test_key' || !hash_equals($expected, $signature)
+    || ($method === 'POST' && ($query['body_md5'] ?? '') !== md5($rawInput))
+) {
     http_response_code(401);
     header('Content-Type: application/json');
-    echo json_encode(['error' => 'Missing authentication parameters']);
+    echo json_encode(['error' => 'Signature or body mismatch']);
+    exit;
+}
+
+if (str_starts_with($path, '/proxy/')) {
+    $path = substr($path, 6);
+}
+
+if ($path === '/apps/123/echo') {
+    header('Content-Type: application/json');
+    echo json_encode(['method' => $method, 'body' => $rawInput, 'headers' => getallheaders(), 'query' => $query]);
+    exit;
+}
+
+if ($path === '/apps/123/redirect') {
+    header('Location: /apps/123/echo', true, 307);
+    exit;
+}
+
+if ($path === '/apps/123/incomplete') {
+    $counter = sys_get_temp_dir() . '/pusher-test-' . $_SERVER['SERVER_PORT'] . '.count';
+    file_put_contents($counter, '1', FILE_APPEND);
+    header('Content-Length: 1000');
+    header('Connection: close');
+    echo '{}';
     exit;
 }
 

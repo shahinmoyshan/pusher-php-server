@@ -2,6 +2,10 @@
 
 namespace Pusher;
 
+use function is_object;
+use function is_string;
+use function strlen;
+
 class PusherCrypto
 {
     private $encryption_master_key;
@@ -33,7 +37,7 @@ class PusherCrypto
         $encrypted_seen = false;
 
         foreach ($channels as $channel) {
-            if(self::is_encrypted_channel($channel)) {
+            if (self::is_encrypted_channel($channel)) {
                 if ($unencrypted_seen) {
                     return true;
                 } else {
@@ -47,7 +51,7 @@ class PusherCrypto
                 }
             }
         }
-        
+
         return false;
     }
 
@@ -98,10 +102,13 @@ class PusherCrypto
      */
     public function decrypt_event(object $event): object
     {
+        if (!is_string($event->data ?? null) || !is_string($event->channel ?? null)) {
+            throw new PusherException('Invalid encrypted event.');
+        }
         $parsed_payload = $this->parse_encrypted_message($event->data);
         $shared_secret = $this->generate_shared_secret($event->channel);
         $decrypted_payload = $this->decrypt_payload($parsed_payload->ciphertext, $parsed_payload->nonce, $shared_secret);
-        if (!$decrypted_payload) {
+        if ($decrypted_payload === false) {
             throw new PusherException('Decryption of the payload failed. Wrong key?');
         }
         $event->data = $decrypted_payload;
@@ -162,10 +169,10 @@ class PusherCrypto
      * @return string plaintext
      * @throws \SodiumException
      */
-    public function decrypt_payload(string $payload, string $nonce, string $shared_secret)
+    public function decrypt_payload(string $payload, string $nonce, string $shared_secret): string|false
     {
         $plaintext = sodium_crypto_secretbox_open($payload, $nonce, $shared_secret);
-        if (empty($plaintext)) {
+        if ($plaintext === false) {
             return false;
         }
 
@@ -207,9 +214,19 @@ class PusherCrypto
             throw new PusherException('Data decoding error.');
         }
 
-        $decoded_payload->nonce = base64_decode($decoded_payload->nonce);
-        $decoded_payload->ciphertext = base64_decode($decoded_payload->ciphertext);
-        if ($decoded_payload->ciphertext === '' || strlen($decoded_payload->nonce) !== SODIUM_CRYPTO_SECRETBOX_NONCEBYTES) {
+        if (
+            !is_object($decoded_payload) || !is_string($decoded_payload->nonce ?? null)
+            || !is_string($decoded_payload->ciphertext ?? null)
+        ) {
+            throw new PusherException('Received a payload that cannot be parsed.');
+        }
+        $decoded_payload->nonce = base64_decode($decoded_payload->nonce, true);
+        $decoded_payload->ciphertext = base64_decode($decoded_payload->ciphertext, true);
+        if (
+            $decoded_payload->ciphertext === false || $decoded_payload->nonce === false
+            || strlen($decoded_payload->ciphertext) < SODIUM_CRYPTO_SECRETBOX_MACBYTES
+            || strlen($decoded_payload->nonce) !== SODIUM_CRYPTO_SECRETBOX_NONCEBYTES
+        ) {
             throw new PusherException('Received a payload that cannot be parsed.');
         }
 

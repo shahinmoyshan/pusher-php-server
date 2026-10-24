@@ -174,4 +174,78 @@ final class HttpPoolAndEndToEndTest extends TestCase
         $this->assertTrue(is_object($results['first']));
         $this->assertTrue(is_object($results['second']));
     }
+
+    public function test_template_body_does_not_leak_into_get_or_replace_post(): void
+    {
+        $template = \Spark\Http\Client\HttpRequest::make('POST')
+            ->withPostFields('stale body')
+            ->withHeader('X-Template', 'retained')
+            ->withTimeout(3);
+        $this->pusher->setClient($template);
+        $get = $this->pusher->get('/echo');
+        $this->assertSame('GET', $get->method);
+        $this->assertSame('', $get->body);
+        $this->assertSame('retained', $get->headers->{'X-Template'});
+        $post = $this->pusher->post('/echo', '{"fresh":"✓"}');
+        $this->assertSame('POST', $post->method);
+        $this->assertSame('{"fresh":"✓"}', $post->body);
+        $this->assertSame('POST', $template->getMethod());
+        $this->assertSame('', $template->getUrl());
+    }
+
+    public function test_path_prefix_is_part_of_the_signature(): void
+    {
+        $pusher = new Pusher('test_key', 'test_secret', '123', [
+            'host' => '127.0.0.1',
+            'port' => $this->port,
+            'scheme' => 'http',
+            'path' => '/proxy',
+        ]);
+        $response = $pusher->post('/echo', '{"message":"exact bytes"}');
+        $this->assertSame('{"message":"exact bytes"}', $response->body);
+    }
+
+    public function test_pool_can_use_same_request_twice_without_mutating_it(): void
+    {
+        $request = $this->pusher->getAsync('/echo');
+        $originalKey = $request->getKey();
+        $responses = $this->pusher->pool(['first' => $request, 'second' => $request]);
+        $this->assertSame(['first', 'second'], array_keys($responses));
+        $this->assertSame('GET', $responses['first']->method);
+        $this->assertSame('GET', $responses['second']->method);
+        $this->assertSame($originalKey, $request->getKey());
+    }
+
+    public function test_redirects_are_returned_as_api_errors(): void
+    {
+        try {
+            $this->pusher->get('/redirect');
+            $this->fail('A signed request must not follow redirects.');
+        } catch (ApiErrorException $error) {
+            $this->assertSame(307, $error->getCode());
+        }
+    }
+
+    public function test_lost_publish_response_does_not_trigger_automatic_retries(): void
+    {
+        $counter = sys_get_temp_dir() . '/pusher-test-' . $this->port . '.count';
+        try {
+            $this->pusher->post('/incomplete', '{}');
+            $this->fail('Expected transport error.');
+        } catch (ApiErrorException $error) {
+            $this->assertSame(0, $error->getCode());
+            $this->assertSame('1', file_get_contents($counter));
+        } finally {
+            if (is_file($counter)) {
+                unlink($counter);
+            }
+        }
+    }
+
+    public function test_encoded_query_values_match_the_wire_signature(): void
+    {
+        $response = $this->pusher->get('/echo', ['filter_by_prefix' => 'literal%2B+ space']);
+        $this->assertSame('literal%2B+ space', $response->query->filter_by_prefix);
+    }
+
 }
